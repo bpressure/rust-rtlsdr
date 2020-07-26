@@ -7,7 +7,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![allow(dead_code)]
+//#![allow(dead_code, unused_parens)]
+
 use std::sync::Arc;
 use std::os::raw::{c_int, c_void, c_uchar, c_char};
 use std::option::Option;
@@ -15,6 +16,7 @@ use std::string::String;
 use std::ffi::CStr;
 use std::ptr;
 use std::str;
+use std::fmt;
 
 
 // TODO:
@@ -62,7 +64,8 @@ const ERROR_ONKNOWN: i32 = -98;
 const LIBUSB_ERROR_ONKNOWN: i32 = -99;
 
 // C lib opaque device struct
-enum RTLSDRDev { }
+enum RTLSDRDev {}
+
 type RTLSDRDevT = RTLSDRDev;
 
 #[derive(Copy, Clone)]
@@ -71,6 +74,7 @@ pub struct Device {
 }
 
 unsafe impl Send for Device {}
+
 unsafe impl Sync for Device {}
 
 // HwInfo holds dongle specific information.
@@ -119,9 +123,21 @@ pub enum Error {
     StringValueTooLong,
     StringDescriptorInvalid,
     StringDescriptorTooLong,
+    NoDeviceFound,
     Unknown,
 }
 
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
 
 
 /// read async callback function
@@ -187,6 +203,13 @@ extern "C" {
     fn rtlsdr_cancel_async(dev: *mut RTLSDRDevT) -> c_int;
 }
 
+fn get_err_msg_result(err: i32) -> Result<(), Error> {
+    match err {
+        0 => Ok(()),
+        _ => Err(get_err_msg(err))
+    }
+}
+
 // FIXME: there has to be a better way...
 fn get_err_msg(e: c_int) -> Error {
     match e {
@@ -238,8 +261,15 @@ pub fn get_device_name(index: i32) -> String {
     unsafe { CStr::from_ptr(rtlsdr_get_device_name(index as u32)).to_string_lossy().into_owned() }
 }
 
+#[derive(Debug)]
+pub struct RtlSdrUsbInfo {
+    manufacture: String,
+    product: String,
+    serial: String,
+}
+
 /// Returns the information of a device by index.
-pub fn get_device_usb_strings(index: i32) -> (String, String, String, Error) {
+pub fn get_device_usb_strings(index: i32) -> Result<RtlSdrUsbInfo, Error> {
     unsafe {
         let m: [c_char; 256] = [0; 256];
         let p: [c_char; 256] = [0; 256];
@@ -248,7 +278,14 @@ pub fn get_device_usb_strings(index: i32) -> (String, String, String, Error) {
                                                 m.as_ptr() as *mut c_char,
                                                 p.as_ptr() as *mut c_char,
                                                 s.as_ptr() as *mut c_char);
-        (from_pchar(m.as_ptr()), from_pchar(p.as_ptr()), from_pchar(s.as_ptr()), get_err_msg(err))
+        match err {
+            0 => Ok(RtlSdrUsbInfo {
+                manufacture: from_pchar(m.as_ptr()),
+                product: from_pchar(p.as_ptr()),
+                serial: from_pchar(s.as_ptr()),
+            }),
+            _ => Err(get_err_msg(err))
+        }
     }
 }
 
@@ -258,32 +295,29 @@ pub fn get_index_by_serial(serial: String) -> i32 {
 }
 
 /// Returns an opened device by index.
-pub fn open(index: i32) -> (Arc<Device>, Error) {
+pub fn open(index: i32) -> Result<Arc<Device>, Error> {
     unsafe {
         let mut dev: *mut RTLSDRDevT = std::ptr::null_mut();
         let err = rtlsdr_open(&mut dev as *mut *mut RTLSDRDevT, index as u32);
-        (Arc::new(Device { dev: dev }), get_err_msg(err))
+        match err {
+            0 => Ok(Arc::new(Device { dev: dev })),
+            _ => Err(get_err_msg(err))
+        }
     }
 }
 
 /// Gets the manufacturer, product, and serial strings from data.
-fn get_string_descriptors(data: &Vec<u8>) -> (String, String, String, Error) {
+fn get_string_descriptors(data: &Vec<u8>) -> Result<(String, String, String), Error> {
     let mut pos = STR_OFFSET_START;
     let mut strings: Vec<String> = Vec::new();
 
     for _ in 0..3 {
         let l = data[pos] as usize;
         if l > (MAX_STR_SIZE * 2) as usize + 2 {
-            return ("".to_string(),
-                    "".to_string(),
-                    "".to_string(),
-                    get_err_msg(STRING_VALUE_TOO_LONG));
+            return Err(get_err_msg(STRING_VALUE_TOO_LONG));
         }
         if data[pos + 1] != 0x03 {
-            return ("".to_string(),
-                    "".to_string(),
-                    "".to_string(),
-                    get_err_msg(STRING_DESCRIPTOR_INVALID));
+            return Err(get_err_msg(STRING_DESCRIPTOR_INVALID));
         }
 
         let mut j: usize = 2;
@@ -295,17 +329,17 @@ fn get_string_descriptors(data: &Vec<u8>) -> (String, String, String, Error) {
         strings.push(s);
         pos += j;
     }
-    (strings[0].clone(), strings[1].clone(), strings[2].clone(), get_err_msg(0))
+    Ok((strings[0].clone(), strings[1].clone(), strings[2].clone()))
 }
 
 /// Sets the manufacturer, product, and serial strings in vec format.
-fn set_string_descriptors(info: &HwInfo, data: &mut Vec<u8>) -> Error {
+fn set_string_descriptors(info: &HwInfo, data: &mut Vec<u8>) -> Result<(), Error> {
     let mlen = info.manufact.len();
     let plen = info.product.len();
     let slen = info.serial.len();
 
     if mlen > MAX_STR_SIZE || plen > MAX_STR_SIZE || slen > MAX_STR_SIZE {
-        return get_err_msg(STRING__DESCRIPTOR_TOO_LONG);
+        return Err(get_err_msg(STRING__DESCRIPTOR_TOO_LONG));
     }
 
     let mut pos = STR_OFFSET_START;
@@ -322,13 +356,13 @@ fn set_string_descriptors(info: &HwInfo, data: &mut Vec<u8>) -> Error {
         }
     }
 
-    get_err_msg(0)
+    Ok(())
 }
 
 impl Device {
     /// Close the device.
-    pub fn close(&self) -> Error {
-        unsafe { get_err_msg(rtlsdr_close(self.dev)) }
+    pub fn close(&self) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_close(self.dev)) }
     }
 
     /// Sets the crystal oscillator frequencies.
@@ -339,28 +373,31 @@ impl Device {
     /// original (cheap) crystal.
     ///
     /// Note, call this function only if you fully understand the implications.
-    pub fn set_xtal_freq(&self, rtl_freq_hz: i32, tuner_freq_hz: i32) -> Error {
+    pub fn set_xtal_freq(&self, rtl_freq_hz: i32, tuner_freq_hz: i32) -> Result<(), Error> {
         unsafe {
-            get_err_msg(rtlsdr_set_xtal_freq(self.dev, rtl_freq_hz as u32, tuner_freq_hz as u32))
+            get_err_msg_result(rtlsdr_set_xtal_freq(self.dev, rtl_freq_hz as u32, tuner_freq_hz as u32))
         }
     }
 
     /// Returns the crystal oscillator frequencies.
     /// Typically both ICs (rtlsdr and tuner) use the same clock.
-    pub fn get_xtal_freq(&self) -> (i32, i32, Error) {
+    pub fn get_xtal_freq(&self) -> Result<(i32, i32), Error> {
         let mut rtl_freq_hz: u32 = 0;
         let mut tuner_freq_hz: u32 = 0;
         unsafe {
             let err = rtlsdr_get_xtal_freq(self.dev,
                                            &mut rtl_freq_hz as *mut u32,
                                            &mut tuner_freq_hz as *mut u32);
-            (rtl_freq_hz as i32, tuner_freq_hz as i32, get_err_msg(err))
+            match err {
+                0 => Ok((rtl_freq_hz as i32, tuner_freq_hz as i32)),
+                _ => Err(get_err_msg(err))
+            }
         }
     }
 
     /// Returns the device information (manufact, product, serial).
     /// Note, strings may be empty.
-    pub fn get_usb_strings(&self) -> (String, String, String, Error) {
+    pub fn get_usb_strings(&self) -> Result<RtlSdrUsbInfo, Error> {
         let m: [c_char; 256] = [0; 256];
         let p: [c_char; 256] = [0; 256];
         let s: [c_char; 256] = [0; 256];
@@ -369,43 +406,46 @@ impl Device {
                                              m.as_ptr() as *mut c_char,
                                              p.as_ptr() as *mut c_char,
                                              s.as_ptr() as *mut c_char);
-            (from_pchar(m.as_ptr()),
-             from_pchar(p.as_ptr()),
-             from_pchar(s.as_ptr()),
-             get_err_msg(err))
+            match err {
+                0 => Ok(RtlSdrUsbInfo {
+                    manufacture: from_pchar(m.as_ptr()),
+                    product: from_pchar(p.as_ptr()),
+                    serial: from_pchar(s.as_ptr()),
+                }),
+                _ => Err(get_err_msg(err))
+            }
         }
     }
 
     /// Writes information data to the EEPROM.
-    pub fn write_eeprom(&self, data: Vec<u8>, offset: u8) -> Error {
+    pub fn write_eeprom(&self, data: Vec<u8>, offset: u8) -> Result<(), Error> {
         unsafe {
-            let mut err = rtlsdr_write_eeprom(self.dev,
-                                              data.as_ptr() as *mut u8,
-                                              offset,
-                                              data.len() as u16);
+            let err = rtlsdr_write_eeprom(self.dev,
+                                          data.as_ptr() as *mut u8,
+                                          offset,
+                                          data.len() as u16);
             if err >= 0 {
-                err = 0;
+                return Ok(());
             }
-            get_err_msg(err)
+            Err(get_err_msg(err))
         }
     }
 
     /// Returns information data read from the EEPROM.
-    pub fn read_eeprom(&self, offset: u8, len: u16) -> (Vec<u8>, Error) {
+    pub fn read_eeprom(&self, offset: u8, len: u16) -> Result<Vec<u8>, Error> {
         let mut v = vec![0u8; len as usize];
         unsafe {
-            let mut err = rtlsdr_read_eeprom(self.dev, v.as_mut_ptr() as *mut u8, offset, len);
+            let err = rtlsdr_read_eeprom(self.dev, v.as_mut_ptr() as *mut u8, offset, len);
             if err >= 0 {
-                err = 0;
+                return Ok(v);
             }
-            (v, get_err_msg(err))
+            Err(get_err_msg(err))
         }
-
     }
 
     /// Sets the center frequency.
-    pub fn set_center_freq(&self, freq_hz: i32) -> Error {
-        unsafe { get_err_msg(rtlsdr_set_center_freq(self.dev, freq_hz as u32)) }
+    pub fn set_center_freq(&self, freq_hz: i32) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_set_center_freq(self.dev, freq_hz as u32)) }
     }
 
     /// Returns the tuned frequency or zero on error.
@@ -413,9 +453,10 @@ impl Device {
         unsafe { rtlsdr_get_center_freq(self.dev) as i32 }
     }
 
+
     /// Sets the frequency correction.
-    pub fn set_freq_correction(&self, ppm: i32) -> Error {
-        unsafe { get_err_msg(rtlsdr_set_freq_correction(self.dev, ppm)) }
+    pub fn set_freq_correction(&self, ppm: i32) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_set_freq_correction(self.dev, ppm)) }
     }
 
     /// Returns the frequency correction value.
@@ -430,23 +471,21 @@ impl Device {
 
     /// Returns a list of supported tuner gains.
     /// Values are in tenths of dB, e.g. 115 means 11.5 dB.
-    pub fn get_tuner_gains(&self) -> (Vec<i32>, Error) {
+    pub fn get_tuner_gains(&self) -> Result<Vec<i32>, Error> {
         unsafe {
             let mut i = rtlsdr_get_tuner_gains(self.dev, ptr::null_mut());
             if i <= 0 {
                 // println!("error rtlsdr_get_tuner_gains <= 0: {}", i);
-                return (Vec::new(), get_err_msg(i));
+                return Err(get_err_msg(i));
             }
             println!("rtlsdr_get_tuner_gains count: {}", i);
             let mut v = vec![0; i as usize];
             i = rtlsdr_get_tuner_gains(self.dev, v.as_mut_ptr());
-            let err = if i <= 0 {
-                Error::Unknown
+            if i <= 0 {
+                Err(Error::Unknown)
             } else {
-                Error::NoError
-            };
-
-            (v, err)
+                Ok(v)
+            }
         }
     }
 
@@ -459,8 +498,8 @@ impl Device {
     /// 340, 420, 430, 450, 470, 490
     ///
     /// Gain values are in tenths of dB, e.g. 115 means 11.5 dB.
-    pub fn set_tuner_gain(&self, gain: i32) -> Error {
-        unsafe { get_err_msg(rtlsdr_set_tuner_gain(self.dev, gain)) }
+    pub fn set_tuner_gain(&self, gain: i32) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_set_tuner_gain(self.dev, gain)) }
     }
 
     /// Returns the tuner gain.
@@ -471,32 +510,30 @@ impl Device {
     }
 
     /// Sets the device bandwidth.
-    pub fn set_tuner_bandwidth(&self, bw_hz: i32) -> Error {
-        unsafe { get_err_msg(rtlsdr_set_tuner_bandwidth(self.dev, bw_hz as u32)) }
+    pub fn set_tuner_bandwidth(&self, bw_hz: i32) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_set_tuner_bandwidth(self.dev, bw_hz as u32)) }
     }
 
     /// Sets the intermediate frequency gain.
     ///
     /// Intermediate frequency gain stage number 1 to 6.
     /// Gain values are in tenths of dB, e.g. -30 means -3.0 dB.
-    pub fn set_tuner_if_gain(&self, stage: i32, gains_tenths_db: i32) -> Error {
-        unsafe { get_err_msg(rtlsdr_set_tuner_if_gain(self.dev, stage, gains_tenths_db)) }
-
+    pub fn set_tuner_if_gain(&self, stage: i32, gains_tenths_db: i32) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_set_tuner_if_gain(self.dev, stage, gains_tenths_db)) }
     }
 
     /// Sets the gain mode, automatic or manual.
     /// Manual gain mode must be enabled for the gain setter function to work.
-    pub fn set_tuner_gain_mode(&self, manual_mode: bool) -> Error {
-        unsafe { get_err_msg(rtlsdr_set_tuner_gain_mode(self.dev, manual_mode as i32)) }
-
+    pub fn set_tuner_gain_mode(&self, manual_mode: bool) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_set_tuner_gain_mode(self.dev, manual_mode as i32)) }
     }
 
     /// Sets the sample rate.
     ///
     /// When applicable, the baseband filters are also selected based
     /// on the requested sample rate.
-    pub fn set_sample_rate(&self, rate_hz: i32) -> Error {
-        unsafe { get_err_msg(rtlsdr_set_sample_rate(self.dev, rate_hz as u32)) }
+    pub fn set_sample_rate(&self, rate_hz: i32) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_set_sample_rate(self.dev, rate_hz as u32)) }
     }
 
     /// Returns the sample rate.
@@ -508,13 +545,13 @@ impl Device {
     ///
     /// Test mode returns 8 bit counters instead of samples. Note,
     /// the counter is generated inside the device.
-    pub fn set_testmode(&self, test_mode: bool) -> Error {
-        unsafe { get_err_msg(rtlsdr_set_testmode(self.dev, test_mode as i32)) }
+    pub fn set_testmode(&self, test_mode: bool) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_set_testmode(self.dev, test_mode as i32)) }
     }
 
     /// Sets the AGC mode.
-    pub fn set_agc_mode(&self, agc_mode: bool) -> Error {
-        unsafe { get_err_msg(rtlsdr_set_agc_mode(self.dev, agc_mode as i32)) }
+    pub fn set_agc_mode(&self, agc_mode: bool) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_set_agc_mode(self.dev, agc_mode as i32)) }
     }
 
     /// Sets the direct sampling mode.
@@ -522,8 +559,8 @@ impl Device {
     /// When enabled, the IF mode of the device is activated, and
     /// set_center_freq() will control the IF-frequency of the DDC, which
     /// can be used to tune from 0 to 28.8 MHz (xtal frequency of the device).
-    pub fn set_direct_sampling(&self, mode: SamplingMode) -> Error {
-        unsafe { get_err_msg(rtlsdr_set_direct_sampling(self.dev, mode as i32)) }
+    pub fn set_direct_sampling(&self, mode: SamplingMode) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_set_direct_sampling(self.dev, mode as i32)) }
     }
 
     /// Returns the state of direct sampling mode.
@@ -540,23 +577,23 @@ impl Device {
 
     /// Sets the offset tuning mode for zero-IF tuners, which
     /// avoids problems caused by the DC offset of the ADCs and 1/f noise.
-    pub fn set_offset_tuning(&self, enable: bool) -> Error {
-        unsafe { get_err_msg(rtlsdr_set_offset_tuning(self.dev, enable as i32)) }
+    pub fn set_offset_tuning(&self, enable: bool) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_set_offset_tuning(self.dev, enable as i32)) }
     }
 
     /// Returns the offset tuning mode.
-    pub fn get_offset_tuning(&self) -> Error {
-        unsafe { get_err_msg(rtlsdr_get_offset_tuning(self.dev)) }
+    pub fn get_offset_tuning(&self) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_get_offset_tuning(self.dev)) }
     }
 
     /// Resets the streaming buffer.
-    pub fn reset_buffer(&self) -> Error {
-        unsafe { get_err_msg(rtlsdr_reset_buffer(self.dev)) }
+    pub fn reset_buffer(&self) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_reset_buffer(self.dev)) }
     }
 
     /// Performs a synchronous read of samples and returns
     /// the number of samples read.
-    pub fn read_sync(&self, len: i32) -> (Vec<u8>, i32, Error) {
+    pub fn read_sync(&self, len: i32) -> Result<(Vec<u8>, i32), Error> {
         let mut buf = vec![0u8; len as usize];
         let mut n_read: i32 = 0;
         unsafe {
@@ -564,10 +601,11 @@ impl Device {
                                        buf.as_mut_ptr() as *mut c_void,
                                        len,
                                        &mut n_read as *mut c_int);
-
-            (buf, n_read, get_err_msg(err))
+            match err {
+                0 => Ok((buf, n_read)),
+                _ => Err(get_err_msg(err))
+            }
         }
-
     }
 
     /// Reads samples asynchronously. Note, this function will block until
@@ -583,72 +621,40 @@ impl Device {
                       ctx: *mut c_void,
                       buf_num: i32,
                       buf_len: i32)
-                      -> Error {
-        unsafe { get_err_msg(rtlsdr_read_async(self.dev, f, ctx, buf_num as u32, buf_len as u32)) }
+                      -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_read_async(self.dev, f, ctx, buf_num as u32, buf_len as u32)) }
     }
 
     /// Cancels all pending asynchronous operations.
-    pub fn cancel_async(&self) -> Error {
-        unsafe { get_err_msg(rtlsdr_cancel_async(self.dev)) }
-
+    pub fn cancel_async(&self) -> Result<(), Error> {
+        unsafe { get_err_msg_result(rtlsdr_cancel_async(self.dev)) }
     }
 
     /// Reads the dongle's information from the EEPROM.
-    pub fn get_hw_info(&self) -> (HwInfo, Error) {
-        let mut have_serial = false;
-        let mut remote_wakeup = false;
-        let mut enable_ir = false;
-        let mut vendor_id = 0u16;
-        let mut product_id = 0u16;
-        let mut m: String = "".to_string();
-        let mut p: String = "".to_string();
-        let mut s: String = "".to_string();
-
-        let (data, mut err) = self.read_eeprom(0, EEPROM_SIZE as u16);
-        // println!("eeprom data: {:?}, error: {:?}", data, err);
-
-        if let Some(Error::NoError) = Some(err) {
-            if (data[0] != 0x28) || (data[1] != 0x32) {
-                err = get_err_msg(NO_VALID_EEPROM_HEADER);
-            } else {
-                vendor_id = (data[3] as u16) << 8 | data[2] as u16;
-                product_id = (data[5] as u16) << 8 | data[4] as u16;
-                // println!("vendor_id {}, product_id {}", vendor_id, product_id);
-
-                if data[6] == 0xA5 {
-                    have_serial = true;
-                }
-                if (data[7] & 0x01) == 0x01 {
-                    remote_wakeup = true;
-                }
-                if (data[7] & 0x02) == 0x02 {
-                    enable_ir = true;
-                }
-
-                let (mm, pp, ss, e) = get_string_descriptors(&data);
-                m = mm;
-                p = pp;
-                s = ss;
-                err = e;
-            }
+    pub fn get_hw_info(&self) -> Result<HwInfo, Error> {
+        let data = self.read_eeprom(0, EEPROM_SIZE as u16)?;
+        if (data[0] != 0x28) || (data[1] != 0x32) {
+            return Err(get_err_msg(NO_VALID_EEPROM_HEADER));
         }
 
-        let info = HwInfo {
-            have_serial: have_serial,
-            vendor_id: vendor_id,
-            product_id: product_id,
-            remote_wakeup: remote_wakeup,
-            enable_ir: enable_ir,
-            manufact: m,
-            product: p,
-            serial: s,
-        };
+        let vendor_id = (data[3] as u16) << 8 | data[2] as u16;
+        let product_id = (data[5] as u16) << 8 | data[4] as u16;
+        let (mm, pp, ss) = get_string_descriptors(&data)?;
 
-        (info, err)
+        Ok(HwInfo {
+            have_serial: data[6] == 0xA5,
+            vendor_id,
+            product_id,
+            remote_wakeup: (data[7] & 0x01) == 0x01,
+            enable_ir: (data[7] & 0x02) == 0x02,
+            manufact: mm,
+            product: pp,
+            serial: ss,
+        })
     }
 
     /// Write the dongle's information to the EEPROM.
-    pub fn set_hw_info(&self, info: &HwInfo) -> Error {
+    pub fn set_hw_info(&self, info: &HwInfo) -> Result<(), Error> {
         let mlen = info.manufact.len();
         let plen = info.product.len();
         let slen = info.serial.len();
@@ -675,11 +681,9 @@ impl Device {
             data[7] = data[7] | 0x02;
         }
 
-        let mut err = set_string_descriptors(&info, &mut data);
-        if let Some(Error::NoError) = Some(err) {
-            err = self.write_eeprom(data, 0);
-        }
+        set_string_descriptors(&info, &mut data)?;
+        self.write_eeprom(data, 0)?;
 
-        err
+        Ok(())
     }
 }

@@ -9,6 +9,7 @@ documentation = "https://jpoirier.github.io/rust-rtlsdr/rtlsdr"
 readme = "README.md"
 keywords = ["SDR", "ffi", "rtlsdr", "rtl-sdr"]
 license = "MIT/Apache-2.0"
+edition = "2018"
 
 [lib]
 name = "rtlsdr"
