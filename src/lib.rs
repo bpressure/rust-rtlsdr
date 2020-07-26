@@ -106,7 +106,6 @@ enum RTLSDRTuner {
 #[derive(Copy, Clone)]
 #[derive(Debug)]
 pub enum Error {
-    NoError,
     Io,
     InvalidParam,
     Access,
@@ -213,7 +212,6 @@ fn get_err_msg_result(err: i32) -> Result<(), Error> {
 // FIXME: there has to be a better way...
 fn get_err_msg(e: c_int) -> Error {
     match e {
-        0 => Error::NoError,
         -1 => Error::Io,
         -2 => Error::InvalidParam,
         -3 => Error::Access,
