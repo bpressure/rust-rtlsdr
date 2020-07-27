@@ -261,9 +261,9 @@ pub fn get_device_name(index: i32) -> String {
 
 #[derive(Debug)]
 pub struct RtlSdrUsbInfo {
-    manufacture: String,
-    product: String,
-    serial: String,
+    pub manufacture: String,
+    pub product: String,
+    pub serial: String,
 }
 
 /// Returns the information of a device by index.
